@@ -1,99 +1,171 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import { App, Editor, MarkdownView, Plugin, TFile, getAllTags } from 'obsidian';
+import { SpellcheckControlSettingTab } from "./settings";
+import { DEFAULT_SETTINGS, SpellcheckControlSettings, Rule, RuleType } from "./types";
 
-// Remember to rename these classes and interfaces!
-
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class SpellcheckControlPlugin extends Plugin {
+	settings: SpellcheckControlSettings;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		this.addSettingTab(new SpellcheckControlSettingTab(this.app, this));
+
+		this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
+			 this.checkAndApplySpellcheck();
+		}));
+		
+		this.registerEvent(this.app.workspace.on('file-open', () => {
+			this.checkAndApplySpellcheck();
+		}));
+		
+		this.app.workspace.onLayoutReady(() => {
+			this.checkAndApplySpellcheck();
 		});
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
-	}
-
-	onunload() {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+		this.checkAndApplySpellcheck();
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	async checkAndApplySpellcheck() {
+		const activeLeaf = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!activeLeaf) return;
+
+		const file = activeLeaf.file;
+		if (!file) return;
+
+		let decision: boolean | null = null;
+		
+		// Evaluate rules. First match wins.
+		for (const rule of this.settings.rules) {
+			if (!rule.enabled) continue;
+			
+			let match = false;
+			try {
+				match = await this.evaluateRule(file, rule);
+			} catch (e) {
+				console.error("Error evaluating rule", rule.name, e);
+			}
+
+			if (match) {
+				decision = rule.enableSpellcheck;
+				break; 
+			}
+		}
+
+		// If a rule matched, apply it. Otherwise ensure default (True).
+		// Note: We assume default is True because Obsidian usually has it on.
+		// If we want to strictly respect global settings when no rule matches, we would need to read global config.
+		// For now, we default to 'true' if no rule is matched, to reset any previous 'false' state.
+		if (decision !== null) {
+			this.setSpellcheck(activeLeaf, decision);
+		} else {
+			this.setSpellcheck(activeLeaf, true);
+		}
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	setSpellcheck(view: MarkdownView, enabled: boolean) {
+		const contentEl = view.contentEl.querySelector('.cm-content');
+		if (contentEl) {
+			contentEl.setAttribute('spellcheck', enabled ? 'true' : 'false');
+		}
+	}
+
+	async evaluateRule(file: TFile, rule: Rule): Promise<boolean> {
+		let match = false;
+		switch (rule.type) {
+			case RuleType.Folder:
+				match = this.evaluateFolderRule(file, rule);
+				break;
+			case RuleType.Tag:
+				match = this.evaluateTagRule(file, rule);
+				break;
+			case RuleType.Property:
+				match = this.evaluatePropertyRule(file, rule);
+				break;
+			case RuleType.Dataview:
+				match = await this.evaluateDataviewRule(file, rule);
+				break;
+		}
+		
+		if (rule.negated) return !match;
+		return match;
+	}
+
+	evaluateFolderRule(file: TFile, rule: Rule): boolean {
+		const rulePath = rule.path || '';
+		if (rulePath === '/' || rulePath === '') {
+			if (rule.recursive) return true;
+			return file.parent?.path === '/';
+		}
+		
+		if (rule.recursive) {
+			return file.path.startsWith(rulePath);
+		} else {
+			 const parentPath = file.parent ? file.parent.path + '/' : '';
+			 // Ensure trailing slash on rulePath for comparison if it's a folder
+			 const normalizedRulePath = rulePath.endsWith('/') ? rulePath : rulePath + '/';
+			 return parentPath === normalizedRulePath;
+		}
+	}
+
+	evaluateTagRule(file: TFile, rule: Rule): boolean {
+		const cache = this.app.metadataCache.getFileCache(file);
+		if (!cache) return false;
+		const tags = getAllTags(cache);
+		if (!tags) return false;
+		
+		const ruleTag = '#' + (rule.tag?.replace(/^#/, '') || '');
+		
+		return tags.some(t => {
+			if (rule.includeSubtags) {
+				return t === ruleTag || t.startsWith(ruleTag + '/');
+			} else {
+				return t === ruleTag;
+			}
+		});
+	}
+
+	evaluatePropertyRule(file: TFile, rule: Rule): boolean {
+		const cache = this.app.metadataCache.getFileCache(file);
+		if (!cache || !cache.frontmatter) return false;
+		
+		const name = rule.propertyName;
+		if (!name) return false; 
+		
+		const val = cache.frontmatter[name];
+		if (val === undefined) return false;
+
+		if (!rule.propertyValue || rule.propertyValue.trim() === '') return true; 
+
+		const targetVal = rule.propertyValue;
+		if (Array.isArray(val)) {
+			return val.some(v => String(v) === targetVal);
+		}
+		return String(val) === targetVal;
+	}
+
+	async evaluateDataviewRule(file: TFile, rule: Rule): Promise<boolean> {
+		 if (!rule.dataviewQuery) return false;
+		 const dv = (this.app as any).plugins.plugins.dataview?.api;
+		 if (!dv) return false;
+		 
+		 try {
+			 const result = await dv.query(rule.dataviewQuery);
+			 if (!result.successful) return false;
+			 
+			 for (const item of result.value.values) {
+				 if (item.path === file.path) return true;
+				 if (item.file?.path === file.path) return true; 
+			 }
+		 } catch(e) {
+			 console.warn("Dataview query failed", e);
+		 }
+		 return false;
 	}
 }
